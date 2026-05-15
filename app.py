@@ -22,12 +22,12 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
+from common.db import db_conn, db_path
 # TODO: import the graph builder + helpers from your exercise 4 solution.
 # Suggestion: rename `exercises/exercise_4_audit.py` functions you need
 # (build_graph, handle_interrupt logic) and import them here, OR copy the
 # graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
@@ -55,7 +55,55 @@ with st.sidebar:
     # TODO: call `audit.replay.list_threads`-style query against audit_events
     # and render thread_id + pr_url + worst_risk + last_event as a small table.
     # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    async def _load_recent_sessions(limit: int = 25) -> list[dict]:
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT thread_id,
+                       pr_url,
+                       MAX(timestamp)  AS last_event,
+                       MAX(risk_level) AS worst_risk
+                  FROM audit_events
+                 GROUP BY thread_id, pr_url
+                 ORDER BY MAX(timestamp) DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    sessions = asyncio.run(_load_recent_sessions())
+    if sessions:
+        st.dataframe(
+            [
+                {
+                    "thread_id": s["thread_id"],
+                    "pr_url": s["pr_url"],
+                    "worst_risk": s["worst_risk"],
+                    "last_event": s["last_event"],
+                }
+                for s in sessions
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        selection = st.selectbox(
+            "Open session",
+            options=sessions,
+            format_func=lambda s: (
+                f"{s['thread_id'][:8]} | {s['worst_risk']} | {s['last_event']} | {s['pr_url']}"
+            ),
+        )
+        if st.button("Load session"):
+            st.session_state.thread_id = selection["thread_id"]
+            st.session_state.pr_url = selection["pr_url"]
+            st.session_state.interrupt_payload = None
+            st.session_state.final = None
+            st.rerun()
+    else:
+        st.caption("No sessions yet")
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -88,11 +136,11 @@ def render_approval_card(payload: dict) -> dict | None:
     #   {"choice": "reject",  "feedback": feedback}
     #   {"choice": "edit",    "feedback": feedback}
     if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
+        return {"choice": "approve", "feedback": feedback}
     if col2.button("Reject"):
-        ...
+        return {"choice": "reject", "feedback": feedback}
     if col3.button("Edit"):
-        ...
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -110,7 +158,11 @@ def render_escalation_card(payload: dict) -> dict | None:
         #       collect answers into a dict {question: answer_str}
         #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        for idx, question in enumerate(payload.get("questions", [])):
+            answers[question] = st.text_input(question, key=f"escalation_q_{idx}")
+        submitted_answers = st.form_submit_button("Submit answers")
+    if submitted_answers:
+        return answers
     return None
 
 
@@ -121,7 +173,7 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
         await cp.setup()
         # TODO: build the graph with `cp` as the checkpointer (use the function
         # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
         # TODO:
@@ -130,7 +182,11 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
         # - Else:                    result = await app.ainvoke(
         #       Command(resume=resume_value), cfg)
         # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        else:
+            result = await app.ainvoke(Command(resume=resume_value), cfg)
+        return result
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
