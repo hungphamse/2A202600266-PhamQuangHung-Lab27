@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from rich.console import Console
 
@@ -40,22 +41,36 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    llm = get_llm().with_structured_output(PRAnalysis)
+    messages = [
+        SystemMessage(content=(
+            "You are an expert code reviewer. Analyze the following pull request diff "
+            "and provide a structured review with a confidence score (0.0–1.0) reflecting "
+            "how confident you are that your review is complete and correct."
+        )),
+        HumanMessage(content=(
+            f"PR Title: {state['pr_title']}\n\n"
+            f"Files changed: {', '.join(state['pr_files'])}\n\n"
+            f"Diff:\n{state['pr_diff']}"
+        )),
+    ]
+    with console.status("[dim]LLM thinking...[/dim]"):
+        analysis = llm.invoke(messages)
+    console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}  summary={analysis.summary[:80]}…")
+    return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    confidence = state["analysis"].confidence
+    if confidence >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif confidence < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
+    console.print(f"  [green]✓[/green] confidence={confidence:.0%} → [bold]{decision}[/bold]")
+    return {"decision": decision}
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -73,13 +88,43 @@ def node_escalate(state: ReviewState) -> dict:
     return {"final_action": "pending_escalation"}
 
 
+def route_decision(state: ReviewState) -> str:
+    """Edge function: returns the name of the next node based on decision."""
+    return state["decision"]
+
+
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+
+    # Add nodes
+    g.add_node("fetch_pr", node_fetch_pr)
+    g.add_node("analyze", node_analyze)
+    g.add_node("route", node_route)
+    g.add_node("auto_approve", node_auto_approve)
+    g.add_node("human_approval", node_human_approval)
+    g.add_node("escalate", node_escalate)
+
+    # Linear edges: START → fetch_pr → analyze → route
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+
+    # Conditional branching from route
+    g.add_conditional_edges(
+        "route",
+        route_decision,
+        {
+            "auto_approve": "auto_approve",
+            "human_approval": "human_approval",
+            "escalate": "escalate",
+        },
+    )
+
+    # Terminal edges → END
+    g.add_edge("auto_approve", END)
+    g.add_edge("human_approval", END)
+    g.add_edge("escalate", END)
+
     return g.compile()
 
 
